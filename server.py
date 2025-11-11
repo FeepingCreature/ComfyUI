@@ -214,6 +214,7 @@ class PromptServer():
             ws = web.WebSocketResponse()
             await ws.prepare(request)
             sid = request.rel_url.query.get('clientId', '')
+            queue_id = request.rel_url.query.get('queueId', None)
             if sid:
                 # Reusing existing session, remove old
                 self.sockets.pop(sid, None)
@@ -223,7 +224,7 @@ class PromptServer():
             # Store WebSocket for backward compatibility
             self.sockets[sid] = ws
             # Store metadata separately
-            self.sockets_metadata[sid] = {"feature_flags": {}}
+            self.sockets_metadata[sid] = {"feature_flags": {}, "queue_id": queue_id}
 
             try:
                 # Send initial state to the new client
@@ -680,12 +681,15 @@ class PromptServer():
             else:
                 offset = -1
 
-            return web.json_response(self.prompt_queue.get_history(max_items=max_items, offset=offset))
+            queue_id = request.rel_url.query.get("queue_id", None)
+
+            return web.json_response(self.prompt_queue.get_history(max_items=max_items, offset=offset, queue_id=queue_id))
 
         @routes.get("/history/{prompt_id}")
         async def get_history_prompt_id(request):
             prompt_id = request.match_info.get("prompt_id", None)
-            return web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id))
+            queue_id = request.rel_url.query.get("queue_id", None)
+            return web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id, queue_id=queue_id))
 
         @routes.get("/queue")
         async def get_queue(request):
@@ -715,6 +719,7 @@ class PromptServer():
             if "prompt" in json_data:
                 prompt = json_data["prompt"]
                 prompt_id = str(json_data.get("prompt_id", uuid.uuid4()))
+                queue_id = json_data.get("queue_id", None)
 
                 partial_execution_targets = None
                 if "partial_execution_targets" in json_data:
@@ -733,7 +738,7 @@ class PromptServer():
                     for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
                         if sensitive_val in extra_data:
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
-                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive, queue_id))
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
                 else:
@@ -751,14 +756,17 @@ class PromptServer():
         @routes.post("/queue")
         async def post_queue(request):
             json_data =  await request.json()
+            queue_id = json_data.get('queue_id', None)
+
             if "clear" in json_data:
                 if json_data["clear"]:
-                    self.prompt_queue.wipe_queue()
+                    delete_func = lambda a: a[6] == queue_id
+                    self.prompt_queue.delete_queue_items(delete_func)
             if "delete" in json_data:
                 to_delete = json_data['delete']
                 for id_to_delete in to_delete:
-                    delete_func = lambda a: a[1] == id_to_delete
-                    self.prompt_queue.delete_queue_item(delete_func)
+                    delete_func = lambda a: a[1] == id_to_delete and a[6] == queue_id
+                    self.prompt_queue.delete_queue_items(delete_func)
 
             return web.Response(status=200)
 
@@ -771,14 +779,16 @@ class PromptServer():
 
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
-            if prompt_id:
+            queue_id = json_data.get('queue_id', None)
+
+            if prompt_id or queue_id:
                 currently_running, _ = self.prompt_queue.get_current_queue()
 
                 # Check if the prompt_id matches any currently running prompt
                 should_interrupt = False
                 for item in currently_running:
-                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
-                    if item[1] == prompt_id:
+                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive, queue_id)
+                    if item[1] == prompt_id and item[6] == queue_id:
                         logging.info(f"Interrupting prompt {prompt_id}")
                         should_interrupt = True
                         break
@@ -788,8 +798,8 @@ class PromptServer():
                 else:
                     logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
             else:
-                # No prompt_id provided, do a global interrupt
-                logging.info("Global interrupt (no prompt_id specified)")
+                # No prompt_id or queue_id provided, do a global interrupt
+                logging.info("Global interrupt (no prompt_id or queue_id specified)")
                 nodes.interrupt_processing()
 
             return web.Response(status=200)

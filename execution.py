@@ -1127,6 +1127,7 @@ class PromptQueue:
                   status: Optional['PromptQueue.ExecutionStatus'], process_item=None):
         with self.mutex:
             prompt = self.currently_running.pop(item_id)
+            queue_id = prompt[6]
             if len(self.history) > MAXIMUM_HISTORY_SIZE:
                 self.history.pop(next(iter(self.history)))
 
@@ -1141,6 +1142,7 @@ class PromptQueue:
                 "prompt": prompt,
                 "outputs": {},
                 'status': status_dict,
+                'queue_id': queue_id,
             }
             self.history[prompt[1]].update(history_result)
             self.server.queue_updated()
@@ -1169,6 +1171,17 @@ class PromptQueue:
             self.queue = []
             self.server.queue_updated()
 
+    def delete_queue_items(self, filter_function):
+        """Delete all queue items matching the filter function."""
+        with self.mutex:
+            original_len = len(self.queue)
+            self.queue = [item for item in self.queue if not filter_function(item)]
+            items_removed = original_len - len(self.queue)
+            if items_removed > 0:
+                heapq.heapify(self.queue)
+                self.server.queue_updated()
+            return items_removed
+
     def delete_queue_item(self, function):
         with self.mutex:
             for x in range(len(self.queue)):
@@ -1182,22 +1195,22 @@ class PromptQueue:
                     return True
         return False
 
-    def get_history(self, prompt_id=None, max_items=None, offset=-1, map_function=None):
+    def get_history(self, prompt_id=None, max_items=None, offset=-1, map_function=None, queue_id=None):
         with self.mutex:
             if prompt_id is None:
                 out = {}
-                i = 0
                 if offset < 0 and max_items is not None:
                     offset = len(self.history) - max_items
-                for k in self.history:
+                for i, k in enumerate(self.history):
                     if i >= offset:
                         p = self.history[k]
+                        if p['queue_id'] != queue_id:
+                            continue
                         if map_function is not None:
                             p = map_function(p)
                         out[k] = p
                         if max_items is not None and len(out) >= max_items:
                             break
-                    i += 1
                 return out
             elif prompt_id in self.history:
                 p = self.history[prompt_id]
